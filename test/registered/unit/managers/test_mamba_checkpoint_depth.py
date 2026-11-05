@@ -12,7 +12,7 @@ then frees two kv-row segments that share the page holding 576.
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -213,6 +213,56 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         ):
             scheduler.init_mamba_truncation_align()
         self.assertEqual(scheduler.truncation_align_size, 192)
+
+    def _window_tree(self, *, windows=(("swa", 512),), checkpoints=256):
+        # Specced to the real cache: the grid asks only what it defines.
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree = create_autospec(UnifiedRadixCache, instance=True)
+        tree.page_size = CHUNK
+        tree.window_sub_pools.return_value = windows
+        tree.window_checkpoint_interval.return_value = checkpoints
+        return tree
+
+    def _unified_grid(self, tree, *, unified=True):
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=1,
+            enable_unified_memory=unified,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            return mamba_prefill_chunk_grid(tree)
+
+    def test_unified_windows_behind_checkpoints_cut_on_the_grid(self):
+        # A prefill retires its window rows behind its latest checkpoint, and
+        # a chunk shorter than the grid takes none, so every cut lands on it.
+        self.assertEqual(self._unified_grid(self._window_tree()), CHUNK)
+        self.assertEqual(self._floor(100, 8192, grid=CHUNK), 64)
+        # No windows, no checkpoints (no prefix sharing), or no unified
+        # memory: the cut stays where the budget put it.
+        self.assertEqual(self._unified_grid(self._window_tree(windows=())), 1)
+        self.assertEqual(self._unified_grid(self._window_tree(checkpoints=0)), 1)
+        self.assertEqual(self._unified_grid(self._window_tree(), unified=False), 1)
+        self.assertEqual(self._unified_grid(None), 1)
+
+    def test_a_chunk_below_the_checkpoint_grid_is_refused_at_startup(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.truncation_align_size = None
+        scheduler.tree_cache = self._window_tree()
+        scheduler.chunked_prefill_size = CHUNK // 2
+        scheduler.disaggregation_mode = None
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            dcp_size=1,
+            enable_unified_memory=True,
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            scheduler.init_mamba_truncation_align()
+            self.assertEqual(scheduler.truncation_align_size, CHUNK)
+            with self.assertRaisesRegex(ValueError, "checkpoint grid"):
+                scheduler.check_truncation_align_fits_chunk()
 
     def test_every_chunk_of_a_cut_up_request_can_still_donate(self):
         # Walk a 100k prompt through chunks the scheduler cut to whatever the

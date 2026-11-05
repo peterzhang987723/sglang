@@ -777,6 +777,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
+    def window_checkpoint_interval(self) -> int:
+        """The interval of the state checkpoints `swa_retain_floor` keeps a
+        window behind: a decode holds up to one row less past its window. 0
+        for a cache without them."""
+        return 0
+
     def window_lengths(self) -> tuple[tuple[str, int], ...]:
         """Each window sub-pool and the history a running request keeps
         behind its frontier in it."""

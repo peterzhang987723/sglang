@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -591,25 +592,40 @@ class _PrefillAdmission:
     replay_len: int
 
 
-def mamba_prefill_chunk_grid() -> int:
+def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> int:
     """Grid a truncated prefill cut must land on, or 1 to leave the cut alone.
 
     DCP donates a mamba checkpoint only when the cached prefix is a whole
     number of kernel chunks from the extend start and also on the radix page.
     A cut off that grid costs the request every later donation. Without DCP,
     #40907 donates from a prefix-relative snapshot, so rounding the cut would
-    only drop up to one grid of prefill budget. A PrefillAdder built before
-    the server config is published, as in unit tests, also leaves the cut.
+    only drop up to one grid of prefill budget, except where windows retire
+    behind the checkpoints: under unified memory with window sub-pools and a
+    prefix-sharing ``tree_cache`` that keeps state checkpoints, a prefill
+    retires window rows only behind its latest checkpoint, and a chunk
+    shorter than the checkpoint grid takes none, so no row is retired. Every
+    cut there lands on that grid (the chunk that ends the prompt may stop
+    anywhere). A PrefillAdder built before the server config is published, as
+    in unit tests, also leaves the cut.
     """
     ctx = get_context()
     if not (
         ctx.is_config_namespace_published("exec")
         and ctx.is_config_namespace_published("parallel")
         and get_exec().mamba.enable_mamba_extra_buffer
-        and get_parallel().dcp_enabled
     ):
         return 1
-    return mamba_cache_chunk_size()
+    if get_parallel().dcp_enabled:
+        return mamba_cache_chunk_size()
+    if (
+        tree_cache is not None
+        and ctx.is_config_namespace_published("memory")
+        and get_memory().enable_unified_memory
+        and tree_cache.window_sub_pools()
+        and tree_cache.window_checkpoint_interval() > 0
+    ):
+        return mamba_checkpoint_grid(tree_cache.page_size)
+    return 1
 
 
 class PrefillAdder:
@@ -639,7 +655,7 @@ class PrefillAdder:
         # that grid costs the request every later donation, so keep it there.
         # Without DCP the prefix-relative depth rule already donates, and
         # rounding would only shorten the chunk.
-        self.mamba_chunk_grid = mamba_prefill_chunk_grid()
+        self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
