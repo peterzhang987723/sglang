@@ -1044,8 +1044,8 @@ class Band:
 
     def available_size(self) -> int:
         """Tokens this band alone can take in place now, nothing in the chain
-        moved. What a take can serve with the chain laid out for it is the
-        chain allocator's read (`units_available`). Memoized on the chain
+        moved. Whether a take fits with the chain laid out for it is the
+        chain allocator's question (`units_fit`). Memoized on the chain
         epoch."""
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch != epoch:

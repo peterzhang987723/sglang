@@ -36,6 +36,7 @@ from sglang.kernels.ops.memory.allocator import (
 )
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.capacity import observe_only_read
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
@@ -243,10 +244,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     # Base init writes `self.size`; the chain computes its capacity.
     @property
     def size(self) -> int:
-        """Token capacity. Without a window, the tokens held plus the same
-        availability `available_size` reads, so the leak census's available
-        term cancels; with one, the sizing's (or the empty pool's) per-side
-        token shares."""
+        """Token capacity. Without a window, the tokens held plus the
+        estimated availability `available_size` reads, so the leak census's
+        available term cancels; with one, the sizing's (or the empty pool's)
+        per-side token shares. Observers only."""
         if not self._windows:
             return self.available_size() + self.full_attn_allocator.allocated_count()
         return min(self._size_full, self._size_swa)
@@ -364,8 +365,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._growth: Dict[str, int] = {b.sub_pool_name: 0 for b in self.bands}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
-        # Largest-fit reads, each kept until the capacity epoch moves.
-        self._fit_memo: Dict[Hashable, Tuple[tuple, int]] = {}
         self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._set_token_shares(full_max_total_num_tokens, swa_max_total_num_tokens)
 
@@ -533,15 +532,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _cap_full_available(self, tokens):
         return self.full_attn_allocator.cap_available(tokens)
 
-    # -- capacity reads --
+    # -- capacity questions --
     #
-    # Every read answers from the same layout search as the take, on the
-    # current snapshot. A sub-pool's availability is the largest demand of
-    # that sub-pool ALONE (every other sub-pool demanding nothing) that a take
-    # can serve now: tokens for a token sub-pool, slots for the state sub-pool.
-    # Sub-pools share bytes, so the availabilities of several sub-pools do not
-    # add up: a per-sub-pool shortfall (demand minus availability) that is zero
-    # everywhere does not prove a joint demand fits; ask `ensure_capacity`.
+    # Sub-pools share bytes, and a demand mixes per-token units (tokens,
+    # window rows) with per-request ones (state slots) in proportions that
+    # differ by request, so no single "units available" answers whether one
+    # fits. Every capacity decision asks the demand itself: `units_fit` and
+    # `ensure_capacity` (now), `admits` (after eviction, with pending work),
+    # `fits_after_frees` (an eviction walk's stop). The scalar reads below are
+    # estimates for observers only (`estimated_units_available`).
 
     def units_fit(self, demands: Dict[str, int]) -> bool:
         """Whether a take of these units (pages of a token sub-pool, slots of
@@ -566,75 +565,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.pricing_snapshot(), {n: d for n, d in demands.items() if d > 0}
         )
 
-    def _largest_fit(self, query: Hashable, names: Tuple[str, ...], hi: int) -> int:
-        """The most units that fit when each of ``names`` takes that many.
-        A fit is downward closed (a smaller demand of the same shape fits
-        whenever a larger one does), so a binary search finds the boundary."""
-        key = (self._snapshot_key_now(), self.full_attn_allocator.max_live_tokens, hi)
-        memo = self._fit_memo.get(query)
-        if memo is not None and memo[0] == key:
-            return memo[1]
-        hi = max(0, hi)
-        low = self._ends_only_fit(names, hi)
-        if low is None:
-            low, high = 0, hi
-            while low < high:
-                mid = (low + high + 1) // 2
-                if self.units_fit(dict.fromkeys(names, mid)):
-                    low = mid
-                else:
-                    high = mid - 1
-        self._fit_memo[query] = (key, low)
-        return low
-
-    def _ends_only_fit(self, names: Tuple[str, ...], hi: int) -> Optional[int]:
-        """`_largest_fit` by arithmetic on a chain with no float (one band, or
-        two ends). One end alone gets its holes and pending pages, the gap to
-        the other end, and the other end's holes and pending pages, which
-        compacting that end hands over. A joint take (each end ``u`` units)
-        shares those bytes: every hole and pending page of the bands it names
-        and of a compactable other, and the gap, over the bytes one unit of
-        each named band takes. Within the FULL cap, each band's index space
-        and ``hi``. The answer is checked against the take's own test
-        (`units_fit`) at it and one past it, so it equals the search's; None
-        (search instead) with a float, or when the arithmetic misses (a fixed
-        page, a page grid the bytes do not divide)."""
-        if any(b.grow_direction == "float" for b in self.bands):
-            return None
-        named = [self.bands[self._band_positions[name]] for name in names]
-        if len(named) == 1:
-            band = named[0]
-            units = band._available_tokens() // band.page_size
-            for other in self.bands:
-                if other is not band and not other.moves_blocked():
-                    units += (
-                        other._reusable_pages() * other.entry_bytes_per_page
-                    ) // band.entry_bytes_per_page
-        else:
-            room = named[0]._current_gap_bytes()
-            for band in self.bands:
-                if band in named or not band.moves_blocked():
-                    room += band._reusable_pages() * band.entry_bytes_per_page
-            units = room // sum(band.entry_bytes_per_page for band in named)
-            for band in named:
-                units = min(
-                    units,
-                    band._reusable_pages()
-                    + band.num_pages
-                    - band.min_page_index
-                    - band._allocated_pages(),
-                )
-        owner = self.full_attn_allocator
-        if owner in named and owner.max_live_tokens is not None:
-            room = max(0, owner.max_live_tokens - owner.allocated_count())
-            units = min(units, room // self.page_size)
-        units = max(0, min(units, hi))
-        if units and not self.units_fit(dict.fromkeys(names, units)):
-            return None
-        if units < hi and self.units_fit(dict.fromkeys(names, units + 1)):
-            return None
-        return units
-
     def _id_bound(self, band: Band) -> int:
         """Units a sub-pool's demand can never exceed: its id owner's room."""
         if band is self.mamba_allocator:
@@ -644,44 +574,84 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return len(owner.free_virtual_ids)
         return owner.ids.num_virtual_ids - owner.min_page_index
 
-    def units_available(self, sub_pool: str) -> int:
-        """The sub-pool's availability (see the contract above): a take of at
-        most this many units of it alone succeeds now, and one more does not."""
+    def _estimated_pages(self, names: Tuple[str, ...]) -> int:
+        """Pages each of ``names`` could take together, by bytes alone: the
+        bytes no live page holds over the bytes one page of each takes,
+        within each band's index space, its id owner's room and the FULL
+        cap. One pass over the bands, ignoring page alignment, fixed pages
+        and pending frees, so a take of this many may fail and a larger one
+        may succeed."""
+        snapshot = self.pricing_snapshot()
+        # Every band's first page lies past the padding sink.
+        sink = min(b.min_page * b.page_bytes for b in snapshot.bands)
+        free_bytes = (
+            snapshot.total_bytes
+            - sink
+            - sum(b.live * b.page_bytes for b in snapshot.bands)
+        )
+        named = [snapshot.bands[snapshot.index(name)] for name in names]
+        pages = max(0, free_bytes) // sum(b.page_bytes for b in named)
+        for b in named:
+            band = self.bands[self._band_positions[b.name]]
+            pages = min(pages, b.num_pages - b.min_page - b.live, self._id_bound(band))
+        owner = self.full_attn_allocator
+        if owner.sub_pool_name in names and owner.max_live_tokens is not None:
+            room = max(0, owner.max_live_tokens - owner.allocated_count())
+            pages = min(pages, room // self.page_size)
+        return max(0, pages)
+
+    def estimated_units_available(self, sub_pool: str) -> int:
+        """An estimate of what sub-pool ``sub_pool`` alone could still take,
+        in tokens (slots for state), for pool statistics, metrics, logs and
+        error text. Not what a take can serve: a capacity decision asks a
+        demand instead (`units_fit`, `admits`), and reading this inside one
+        is a violation (`capacity.observe_only_read`)."""
+        observe_only_read("ChainAllocator.estimated_units_available")
         band = self.bands[self._band_positions[sub_pool]]
-        pages = self._largest_fit((sub_pool,), (sub_pool,), self._id_bound(band))
+        pages = self._estimated_pages((sub_pool,))
         return pages if band is self.mamba_allocator else pages * self.page_size
 
+    def state_slots_fit(self, count: int) -> bool:
+        """Whether ``count`` state slots can be taken now."""
+        return count <= 0 or self.units_fit({self.mamba_allocator.sub_pool_name: count})
+
+    def estimated_state_slots_available(self) -> int:
+        """`estimated_units_available` of the state sub-pool: observers only."""
+        return self.estimated_units_available(self.mamba_allocator.sub_pool_name)
+
+    def held_units(self, sub_pool: str) -> int:
+        """Units sub-pool ``sub_pool`` holds now: tokens (slots for state)."""
+        return self.bands[self._band_positions[sub_pool]].allocated_count()
+
+    # The scalar reads the shared allocator interface requires: estimates
+    # (`estimated_units_available`), never for decisions.
+
     def available_size(self) -> int:
-        """Tokens one more token allocation can take now: the owner and every
-        window take each new token together. Without a window that is the
-        owner's own availability, the same question and the same memo entry
-        as `full_available_size`."""
+        """An estimate of the tokens one more token allocation could take: the
+        owner and every window take each new token together. Observers only."""
+        observe_only_read("ChainAllocator.available_size")
         names = tuple(
             b.sub_pool_name for b in (self.full_attn_allocator, *self._windows)
         )
-        hi = self._id_bound(self.full_attn_allocator)
-        return self._largest_fit(names, names, hi) * self.page_size
+        return self._estimated_pages(names) * self.page_size
 
     def owner_available_size(self):
-        """What the token pool can serve now: its full-attention side."""
+        """An estimate of the token sub-pool's availability. Observers only."""
         return self.full_available_size()
 
     def full_available_size(self) -> int:
-        return self.units_available(self.full_attn_allocator.sub_pool_name)
+        return self.estimated_units_available(self.full_attn_allocator.sub_pool_name)
 
     def swa_available_size(self) -> int:
         if self.swa_attn_allocator is None:
             raise AttributeError("a chain without a window has no window tokens")
-        return self.units_available(self.swa_attn_allocator.sub_pool_name)
+        return self.estimated_units_available(self.swa_attn_allocator.sub_pool_name)
 
     def window_available_size(self, sub_pool: str) -> int:
-        """What a take from window sub-pool ``sub_pool`` can serve now."""
+        """An estimate of window sub-pool ``sub_pool``'s availability."""
         if sub_pool not in self.window_pool_names():
             raise KeyError(f"no window sub-pool {sub_pool!r}")
-        return self.units_available(sub_pool)
-
-    def state_slots_available(self) -> int:
-        return self.units_available(self.mamba_allocator.sub_pool_name)
+        return self.estimated_units_available(sub_pool)
 
     def conserve_full_available_size(self) -> int:
         """The sizing's nominal owner share minus the owner tokens held: the
@@ -691,21 +661,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def conserve_swa_available_size(self) -> int:
         """The sizing's nominal window share minus the window tokens held."""
         return self._size_swa - self.swa_attn_allocator.allocated_count()
-
-    def schedulable_full_available_size(self) -> int:
-        return self.full_available_size()
-
-    def schedulable_swa_available_size(self) -> int:
-        return self.swa_available_size()
-
-    @property
-    def current_full_capacity(self) -> int:
-        """Owner tokens held now plus what the owner alone could still take."""
-        return self.full_available_size() + self.full_attn_allocator.allocated_count()
-
-    @property
-    def current_swa_capacity(self) -> int:
-        return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
 
     @property
     def size_full(self) -> int:
@@ -858,10 +813,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self.admits(demand, empty_pool=True)
 
     def window_capacity_and_available(self, sub_pool: str) -> Tuple[int, int]:
-        """Window sub-pool ``sub_pool``'s tokens held plus what a take from it
-        can serve now, and that take's reach (the planner's answer)."""
+        """Window sub-pool ``sub_pool``'s tokens held plus its estimated
+        availability, and that estimate (`estimated_units_available`).
+        Observers only."""
         band = self._window_band(sub_pool)
-        available = self.units_available(sub_pool)
+        available = self.estimated_units_available(sub_pool)
         return available + band.allocated_count(), available
 
     def _window_band(self, sub_pool: str):
@@ -880,31 +836,26 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     ) -> bool:
         """A decode-node preallocation on the admission rule: its tokens, every
         window's own tail and the state slots it takes with them, priced
-        together since they share bytes. The budgets are the scheduler's
-        token views of the owner and of each window after decode headroom and
-        retraction, by window sub-pool name. What they hold back from a
-        side's reachable tokens is pending demand, charged alongside the
-        request in one admission question; no budget caps a side on its own,
-        since reclaiming one side's entries frees bytes another can take
-        (the FULL live-token cap, the ids and the placement stay in
-        `admits`)."""
+        together since they share bytes. The scheduler's budgets over a pool
+        whose sub-pools share memory count from zero
+        (`capacity.shares_memory`): each is minus what it holds back for
+        pending work (decode headroom, retracted and in-flight requests), by
+        window sub-pool name for the windows. That pending demand is charged
+        alongside the request in one admission question; no budget caps a
+        side on its own, since reclaiming one side's entries frees bytes
+        another can take (the FULL live-token cap, the ids and the placement
+        stay in `admits`)."""
         demand = demand.checked(self.window_pool_names())
-        full_tokens = demand.full_tokens
         windows = dict(demand.window_tokens)
-        budgets = dict(window_budget_tokens or {})
-        evictable = dict(evictable)
-        owner = self.full_attn_allocator.sub_pool_name
-        full_tokens += max(
-            0,
-            self.full_available_size() + evictable.get(owner, 0) - full_budget_tokens,
-        )
-        for name, budget in budgets.items():
-            windows[name] += max(
-                0,
-                self.window_available_size(name) + evictable.get(name, 0) - budget,
-            )
+        for name, budget in (window_budget_tokens or {}).items():
+            windows[name] += max(0, -budget)
         return self.admits(
-            KVDemand(full_tokens, windows, demand.state_slots), evictable=evictable
+            KVDemand(
+                demand.full_tokens + max(0, -full_budget_tokens),
+                windows,
+                demand.state_slots,
+            ),
+            evictable=evictable,
         )
 
     def prealloc_shortfall(self, demand: KVDemand) -> str | None:
@@ -935,32 +886,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
         """Each sub-pool's (capacity, available units), by sub-pool name: the
-        units it holds plus its availability, and its availability."""
-        owner = self.full_attn_allocator
-        usage = {
-            owner.sub_pool_name: (
-                self.current_full_capacity,
-                self.full_available_size(),
-            )
-        }
-        for window in self._windows:
-            free = self.units_available(window.sub_pool_name)
-            usage[window.sub_pool_name] = (window.allocated_count() + free, free)
-        if self.mamba_allocator is not None:
-            # Free state ids whose bytes another sub-pool holds now are neither
-            # held nor available, so the capacity is not the pool's slot count.
-            free = self.state_slots_available()
-            usage[self.mamba_allocator.sub_pool_name] = (
-                self.mamba_allocator.allocated_count() + free,
-                free,
-            )
+        units it holds plus its estimated availability, and that estimate
+        (`estimated_units_available`). The held units are exact, so a leak
+        census comparing what is held against the capacity stays exact.
+        Observers only."""
+        usage = {}
+        for band in self.bands:
+            name = band.sub_pool_name
+            free = self.estimated_units_available(name)
+            usage[name] = (band.allocated_count() + free, free)
         return usage
-
-    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
-        return (
-            (self.current_full_capacity, self.full_available_size()),
-            (self.current_swa_capacity, self.swa_available_size()),
-        )
 
     def _ceiling_windows(self, sliding_window_size: int | None) -> Dict[str, int]:
         """The tail a lone request keeps of each window: the storage's

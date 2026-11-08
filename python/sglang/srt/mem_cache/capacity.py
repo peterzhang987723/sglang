@@ -15,16 +15,76 @@ together is the pool's reclaim discipline, chosen in one place
 
 Every caller, the prefix cache's `evict_for_alloc` included, goes through the
 discipline; none reads the allocator's declaration itself.
+
+A pool whose sub-pools share one memory has no scalar availability a decision
+can use: sub-pools take each other's bytes, and a request's demand has a
+per-token part (tokens, window rows) and a per-request part (state slots) in
+proportions that differ by request. Its decisions ask a concrete demand; its
+scalar reads are estimates for observers (stats, logs, error text) only.
+`capacity_decision` marks the decision paths, and an estimate read inside one
+is an invariant violation (`observe_only_read`).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping, Optional
+import functools
+import logging
+import threading
+from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictResult
+
+logger = logging.getLogger(__name__)
+
+
+class _DecisionScope(threading.local):
+    depth = 0
+    warned: frozenset = frozenset()
+
+
+_decision_scope = _DecisionScope()
+
+
+def capacity_decision(fn):
+    """Mark ``fn`` as a capacity decision: while it runs, reading a
+    shared-memory pool's availability estimate is a violation
+    (`observe_only_read`)."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        _decision_scope.depth += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _decision_scope.depth -= 1
+
+    return wrapper
+
+
+def observe_only_read(what: str) -> None:
+    """Called by every availability estimate of a shared-memory pool. Inside a
+    capacity decision the read is a bug, since the estimate does not say
+    whether any demand fits: it raises under strict invariant checks and
+    logs once per read under warn."""
+    if not _decision_scope.depth:
+        return
+    from sglang.srt.environ import InvariantCheckLevel
+    from sglang.srt.utils.invariants import resolve_level
+
+    level = resolve_level()
+    message = (
+        f"{what} is an observe-only estimate of a pool whose sub-pools share "
+        "memory, read inside a capacity decision; ask a demand instead "
+        "(ChainAllocator.admits, units_fit, or sglang.srt.mem_cache.capacity)"
+    )
+    if level >= InvariantCheckLevel.STRICT:
+        raise AssertionError(message)
+    if level >= InvariantCheckLevel.WARN and what not in _decision_scope.warned:
+        _decision_scope.warned = _decision_scope.warned | {what}
+        logger.warning(message)
 
 
 def windows_reclaimed_first() -> bool:
@@ -65,6 +125,14 @@ class _OwnPools:
     def windows_share_owner_memory(self, allocator) -> bool:
         return False
 
+    shares_memory = False
+
+    def owner_rows_ready(self, tree_cache, allocator, full_tokens, available):
+        if available() < full_tokens:
+            tree_cache.evict_for_alloc(KVDemand(full_tokens=full_tokens))
+            return available() >= full_tokens
+        return True
+
     def reclaim_for_prealloc(self, tree_cache, allocator, demand):
         return allocator.reclaim_for_prealloc(tree_cache, demand)
 
@@ -95,6 +163,14 @@ class _SharedMemory:
 
     def windows_share_owner_memory(self, allocator) -> bool:
         return bool(allocator.window_pool_names())
+
+    shares_memory = True
+
+    def owner_rows_ready(self, tree_cache, allocator, full_tokens, available):
+        demand = KVDemand(full_tokens=full_tokens).completed(
+            allocator.window_pool_names()
+        )
+        return self.reclaim_for_load_back(tree_cache, allocator, demand) is None
 
     def reclaim_for_prealloc(self, tree_cache, allocator, demand):
         if _shares_prefixes(tree_cache):
@@ -140,6 +216,29 @@ def discipline(allocator):
     return _SHARED_MEMORY if allocator.pools_share_memory else _OWN_POOLS
 
 
+def shares_memory(allocator) -> bool:
+    """Whether ``allocator``'s sub-pools share one memory: then no sub-pool
+    has an availability of its own, and every capacity decision asks a
+    demand of it."""
+    return discipline(allocator).shares_memory
+
+
+@capacity_decision
+def owner_rows_ready(
+    tree_cache: BasePrefixCache,
+    allocator,
+    full_tokens: int,
+    available: Callable[[], int],
+) -> bool:
+    """Evict, then check, until a host load's ``full_tokens`` token rows can be
+    taken. Pools of their own compare the token pool's ``available`` read;
+    a shared memory reclaims and asks the demand itself."""
+    return discipline(allocator).owner_rows_ready(
+        tree_cache, allocator, full_tokens, available
+    )
+
+
+@capacity_decision
 def reclaim_for_prealloc(
     tree_cache: Optional[BasePrefixCache], allocator, demand: KVDemand
 ) -> Optional[str]:
@@ -149,6 +248,7 @@ def reclaim_for_prealloc(
     return discipline(allocator).reclaim_for_prealloc(tree_cache, allocator, demand)
 
 
+@capacity_decision
 def admit_preallocation(
     tree_cache: Optional[BasePrefixCache],
     allocator,
@@ -174,6 +274,7 @@ def admit_preallocation(
     )
 
 
+@capacity_decision
 def reclaim_for_load_back(
     tree_cache: Optional[BasePrefixCache], allocator, demand: KVDemand
 ) -> Optional[str]:
@@ -181,6 +282,7 @@ def reclaim_for_load_back(
     return discipline(allocator).reclaim_for_load_back(tree_cache, allocator, demand)
 
 
+@capacity_decision
 def evict_to_free_tokens(
     tree_cache: Optional[BasePrefixCache], allocator, num_tokens: int
 ) -> Optional[bool]:
@@ -190,6 +292,7 @@ def evict_to_free_tokens(
     return discipline(allocator).evict_to_free_tokens(tree_cache, allocator, num_tokens)
 
 
+@capacity_decision
 def check_decode_capacity(
     tree_cache: Optional[BasePrefixCache],
     allocator,
@@ -209,6 +312,7 @@ def check_decode_capacity(
     )
 
 
+@capacity_decision
 def create_prefill_budget(
     allocator, tree_cache: Optional[BasePrefixCache], *, num_mixed_decode_tokens=0
 ):
@@ -218,6 +322,7 @@ def create_prefill_budget(
     )
 
 
+@capacity_decision
 def evict_for_alloc(cache: BasePrefixCache, demand: KVDemand) -> EvictResult:
     """Evict from ``cache`` so that an allocation of ``demand`` (what it will
     take, not what to evict) can be served, by its pool's discipline."""

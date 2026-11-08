@@ -47,6 +47,25 @@ def chain_snapshot(allocator) -> ChainSnapshot:
     )
 
 
+def largest_take(allocator, *sub_pools: str) -> int:
+    """The most units each of ``sub_pools`` can take together now (the token
+    sub-pool and every window when none is named): tokens of a token
+    sub-pool, slots of the state sub-pool. A binary search over the take's
+    own test (`ChainAllocator.units_fit`): an exact oracle for tests, which
+    the scheduler never needs, since it asks each demand itself."""
+    owner, windows, state = allocator.sub_pool_roles()
+    if not sub_pools:
+        sub_pools = (owner, *windows)
+    low, high = 0, max(band.num_pages for band in allocator.bands)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if allocator.units_fit(dict.fromkeys(sub_pools, mid)):
+            low = mid
+        else:
+            high = mid - 1
+    return low if sub_pools == (state,) else low * allocator.page_size
+
+
 def open_float_side(flt, side: str, min_bytes: int) -> int:
     """Move a float's live pages, as a planned layout does (`relocate_into`
     of one packed block), so the gap on ``side`` holds at least ``min_bytes``;
@@ -993,7 +1012,7 @@ def _layer_maps(bundle) -> dict:
 def _capacity_summary(bundle) -> dict:
     allocator = bundle.token_to_kv_pool_allocator
     out = {
-        "available": allocator.available_size(),
+        "available": largest_take(allocator),
         "size_full": allocator.size_full,
         "draft_virtual_id_space": allocator.draft_virtual_id_space,
     }
