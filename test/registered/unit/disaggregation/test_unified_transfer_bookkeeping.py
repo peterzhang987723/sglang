@@ -924,7 +924,10 @@ class TestTheLedgerFencesAFailedTransfersPages(CustomTestCase):
         self.assertEqual(owner.available_size(), available - quarantined)
         usage = {u.name: u for u in storage.usage()}
         self.assertEqual(usage[allocator.roles.owner].quarantined, quarantined)
-        self.assertTrue(owner.moves_blocked(), "never moved")
+        # An end band keeps compacting around them, and never hands them out.
+        self.assertFalse(owner.moves_blocked())
+        owner.flush_for_allocation()
+        self.assertEqual(owner.available_size(), available - quarantined)
         taken = owner.alloc(owner.available_size())
         self.assertTrue(orphan.pages.isdisjoint(_physical_pages(owner, taken)))
         owner.free(taken)

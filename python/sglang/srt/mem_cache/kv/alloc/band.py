@@ -2488,9 +2488,13 @@ class Band:
         """QUARANTINE ``pages`` for ``transfer``, never proven to have stopped:
         they leave capacity and stay where they are until it is released.
         Holes among them leave the free list now, and pages freed later
-        (`release`) never join it; every one is fixed, so no move goes over or
-        away from it and the frontier keeps it inside the band. Reads the free
-        list on the host."""
+        (`release`) never join it: they wait as pending pages no drain returns
+        before the release, which no move takes as a destination, and the
+        transfer's fences keep them inside the span. An end band packs live
+        pages around them as around any pending page; a float, whose
+        relocations take every page of its span that is not a hole for a live
+        one, also fixes them, which stops its relocations until the release.
+        Reads the free list on the host."""
         pages = set(pages)
         if not pages:
             return
@@ -2510,7 +2514,8 @@ class Band:
                 return
         self._quarantined[id(transfer)] = (transfer, pages)
         self._quarantined_pages |= pages
-        self.fix_pages(transfer, sorted(pages))
+        if self.grow_direction == "float":
+            self.fix_pages(transfer, sorted(pages))
         free = self._free_pages_snapshot()
         holes = sorted(pages.intersection(free))
         if holes:
@@ -2741,8 +2746,10 @@ class Band:
         if not self.usage.has_pending():
             return
         with record_function("Band._drain_pending_reuse"):
+            # A QUARANTINED page returns only once its transfer is released,
+            # never by an urgent drain's wait.
             ready = self.usage.take_ready_vacated(
-                urgent=urgent, keep=self.fixed_pages()
+                urgent=urgent, keep=self.fixed_pages() | self._quarantined_pages
             )
             waits = []
             for use in ready:
