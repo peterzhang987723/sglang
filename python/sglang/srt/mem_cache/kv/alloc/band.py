@@ -1352,6 +1352,50 @@ class Band:
             op.geometry.add(id(self))
         return sum(1 for page in self._free_pages_snapshot() if page in fenced)
 
+    def _cover_network_fenced_pages(self) -> bool:
+        """Grow the span back over pages an unreleased network transfer's
+        fence covers that a move left beyond the frontier (it retreats past
+        the sources it vacates): they become holes under the fence, taken last
+        and only after the transfer ends, never growth a take cannot avoid nor
+        bytes a quarantine would fix outside the span. Returns whether the
+        span grew."""
+        fenced = self._network_fenced_pages()
+        if not fenced:
+            return False
+        first, end = self._span_range()
+        if self.grow_direction == "up":
+            beyond = [page for page in fenced if page >= end]
+            if not beyond:
+                return False
+            extension = self._advance_frontier(max(beyond) + 1 - end)
+        else:
+            beyond = [p for p in fenced if self.min_page_index <= p < first]
+            if not beyond:
+                return False
+            extension = self._advance_frontier(first - min(beyond))
+        if extension is None:
+            logger.warning(
+                "%s: pages a network transfer may still touch lie past a "
+                "neighbour's frontier; a write there waits for the transfer.",
+                self.sub_pool_name,
+            )
+            return False
+        gap = list(range(*extension))
+        self._return_to_span(gap)
+        return True
+
+    def _return_to_span(self, pages: List[int]) -> None:
+        """Pages the span grew back over join it as holes (a QUARANTINED one
+        stays withheld), through the one release path."""
+        if pages:
+            self.release(
+                torch.tensor(pages, dtype=torch.int64, device=self.device),
+                Release.VACATED,
+                host=list(pages),
+            )
+        self._holes_dirty = True
+        self._capacity_epoch += 1
+
     def _kept_in_span(self) -> Set[int]:
         """Pages the span keeps covering, free or not: fixed ones, and those an
         unreleased network transfer's fence covers."""
@@ -2450,6 +2494,20 @@ class Band:
         pages = set(pages)
         if not pages:
             return
+        # A page left beyond the frontier comes back into the span first: a
+        # fixed page outside it would make growth over it fail.
+        self._cover_network_fenced_pages()
+        first, end = self._span_range()
+        outside = {page for page in pages if not first <= page < end}
+        if outside:
+            logger.warning(
+                "%s: %d quarantined pages lie outside the span; they stay fenced.",
+                self.sub_pool_name,
+                len(outside),
+            )
+            pages -= outside
+            if not pages:
+                return
         self._quarantined[id(transfer)] = (transfer, pages)
         self._quarantined_pages |= pages
         self.fix_pages(transfer, sorted(pages))
@@ -3179,7 +3237,11 @@ class Band:
         settles the band's pending pages first (`settle_pending_for_recovery`)."""
         with record_function("Band.flush_for_allocation"):
             with settle_pending_for_recovery((self,)):
-                return self._flush(urgent=True)
+                moved = self._flush(urgent=True)
+            # The retreat may have passed sources a network transfer still
+            # reads: keep their bytes in the span.
+            self._cover_network_fenced_pages()
+            return moved
 
     def flush_opportunistic(self) -> int:
         """Public, non-urgent flush at quiescent points; never blocks
@@ -3475,6 +3537,34 @@ class FloatBand(Band):
 
     def _live_pages(self) -> int:
         return self._occupied_pages() - self._pending_until_retire_pages
+
+    def _cover_network_fenced_pages(self) -> bool:
+        """`Band._cover_network_fenced_pages` for a float: the span grows on
+        either side, within the region between its neighbours."""
+        fenced = self._network_fenced_pages()
+        if not fenced:
+            return False
+        lo, hi = self._region_bounds_pages()
+        reach = [page for page in fenced if lo <= page < hi]
+        if len(reach) < len(fenced):
+            logger.warning(
+                "%s: pages a network transfer may still touch lie past a "
+                "neighbour's frontier; a write there waits for the transfer.",
+                self.sub_pool_name,
+            )
+        low, high = self.low_wm_page, self.high_wm_page
+        if high <= low:
+            if not reach:
+                return False
+            low = high = min(reach)
+        new_low = min([low, *reach])
+        new_high = max([high, *(page + 1 for page in reach)])
+        if (new_low, new_high) == (self.low_wm_page, self.high_wm_page):
+            return False
+        gap = [page for page in range(new_low, new_high) if not low <= page < high]
+        self.low_wm_page, self.high_wm_page = new_low, new_high
+        self._return_to_span(gap)
+        return True
 
     def _is_frontier_transparent(self) -> bool:
         # A fixed page keeps the span where it is, free or not, and so does a
@@ -3846,7 +3936,11 @@ class FloatBand(Band):
         if self.moves_blocked() or gap_side_bytes >= min_bytes:
             return gap_side_bytes
         with settle_pending_for_recovery((self,)):
-            return self._make_room(side, min_bytes)
+            opened = self._make_room(side, min_bytes)
+        if self._cover_network_fenced_pages():
+            gap_low, gap_high = self._gap_pages()
+            opened = (gap_low if side == "low" else gap_high) * epp
+        return opened
 
     def _make_room(self, side: str, min_bytes: int) -> int:
         # The recovery entry settled the float: the geometry sees holes and
@@ -4076,7 +4170,9 @@ class FloatBand(Band):
                 return 0  # settled and parked: nothing left to pack
             # `_relocate_to_positions` orders its copies before their first write.
             holes = set(self._free_pages_snapshot(after_wait=True))
-            return self._pack_live(holes, retreat_side)
+            moved = self._pack_live(holes, retreat_side)
+        self._cover_network_fenced_pages()
+        return moved
 
     def _pack_live(self, holes: Set[int], retreat_side: str) -> int:
         live_sorted = [

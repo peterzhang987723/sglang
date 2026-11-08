@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation import prefill
@@ -454,7 +455,8 @@ class TestRankSkewedWaitAfterCompaction(CustomTestCase):
     def _rank(self, backup_done):
         """One rank: a send reads the two pages nearest the frontier and a
         host backup reads one of them; an urgent compaction moves both into
-        interior holes, and a take reuses both. Returns what the rank passed
+        interior holes, and a take of every page reuses both (the span keeps
+        their bytes, holes a take reaches last). Returns what the rank passed
         to the collective."""
         setup_allocator_context()
         bundle = build_unified_bundle(
@@ -511,8 +513,10 @@ class TestRankSkewedWaitAfterCompaction(CustomTestCase):
         ):
             self.assertEqual(full.flush_for_allocation(), 2)
             self.assertEqual(reduced, [], "the move itself waits for no reader")
-            pages = full.acquire(2, Consumer.FORWARD)
-        self.assertEqual(sorted(pages.tolist()), sent, "the take reuses both pages")
+            pages = full.acquire(
+                full.available_size() // full.page_size, Consumer.FORWARD
+            )
+        self.assertTrue(set(sent) <= set(pages.tolist()), "the take reuses both")
         return reduced
 
     def test_ranks_whose_backup_ended_apart_enter_the_same_collective(self):
@@ -984,6 +988,42 @@ class TestTheLedgerFencesAFailedTransfersPages(CustomTestCase):
                 owner.flush_opportunistic()
                 allocator.clear()
                 self.assertEqual(allocator.available_size(), total)
+
+    def test_a_send_row_moved_past_the_frontier_is_quarantined_without_a_crash(
+        self,
+    ):
+        """REGRESSION: an urgent flush moved a row an in-flight send still
+        read and retreated the frontier past the bytes it vacated; once the
+        send failed unproven, the quarantine fixed those bytes outside the
+        span, and the next growth over them raised "a fixed page cannot be
+        written". The span keeps fenced bytes inside it, so growth skips
+        them and the quarantine holds them in place."""
+        allocator, storage = _tri_pool()
+        storage.set_network_waiter(lambda transfers: None)
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        proof = {"done": False}
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        req = SimpleNamespace(rid="s", bootstrap_room=11, kv=ReqKvInfo())
+        self.assertIsNotNone(storage.acquire([req]))
+        ids = owner.alloc(8 * page)
+        # The page nearest the frontier is the first a compaction moves.
+        top = set(_physical_pages(owner, ids[:page]))
+        _record(allocator, req, sorted(top), writes=False, peer=proof)
+        owner.free(ids[2 * page : 6 * page])  # interior holes
+        self.assertGreater(owner.flush_for_allocation(), 0)
+        self.assertNotEqual(set(_physical_pages(owner, ids[:page])), top, "it moved")
+        first, end = owner._span_range()
+        self.assertTrue(all(first <= p < end for p in top), "kept in the span")
+        # The send fails unproven; its request is gone; past the bound.
+        owner.free(torch.cat([ids[: 2 * page], ids[6 * page :]]))
+        storage.release_row(req)
+        with self.assertLogs(utils_mod.logger, level="ERROR"):
+            _reaper(storage, quarantine_after=0.0).resolve()
+        taken = owner.alloc(owner.available_size())
+        self.assertIsNotNone(taken)
+        self.assertTrue(top.isdisjoint(_physical_pages(owner, taken)))
 
     def test_a_pool_clear_without_transfers_resets(self):
         allocator, storage = _tri_pool()
