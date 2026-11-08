@@ -152,10 +152,10 @@ class TestNetworkTransfers(CustomTestCase):
         self.assertEqual(calls, [["peer"]])
         self.assertNotEqual(_physical_pages(owner, ids[:1]), top)
 
-    def test_releasing_the_row_ends_the_transfer(self):
-        """A request aborted mid-transfer never commits; its row release is
-        the failed transfer's release point, where every one of its transfers
-        ends."""
+    def test_releasing_the_row_orphans_the_transfer(self):
+        """A request aborted mid-transfer never commits; its row release
+        orphans each of its transfers not yet released: they stay unreleased,
+        their bytes fenced in the ledger, until proof of their end."""
         allocator, storage = _tri_pool()
         owner = allocator.full_attn_allocator
         ids = owner.alloc(4)
@@ -165,10 +165,19 @@ class TestNetworkTransfers(CustomTestCase):
         _record(allocator, req, _physical_pages(owner, ids[1:2]), writes=True)
         transfers = [use.release for use in owner.usage.transfers()]
         self.assertEqual(len(transfers), 2)
-        self.assertFalse(any(t.released for t in transfers))
         storage.release_row(req)
-        self.assertTrue(all(t.released for t in transfers))
+        self.assertFalse(any(t.released for t in transfers))
         self.assertFalse(storage._network_transfers)
+        self.assertEqual([o.transfer for o in storage.orphaned_transfers()], transfers)
+        self.assertFalse(owner.usage.transfers(), "they became fences")
+        self.assertEqual(
+            owner._network_fenced_pages(),
+            set(_physical_pages(owner, ids[:2])),
+        )
+        for orphan in storage.orphaned_transfers():
+            storage.settle_orphaned_transfer(orphan)
+        self.assertTrue(all(t.released for t in transfers))
+        self.assertFalse(owner._network_fenced_pages())
 
 
 class TestTransfersBelongToTheRequestNotItsRid(CustomTestCase):

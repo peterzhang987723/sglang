@@ -235,18 +235,22 @@ class NetworkTransferWaiter:
     together anyway. Between rounds it sleeps, releasing the GIL: the engine's
     threads report through Python, so a wait that held it would never end.
 
-    ``done`` follows the transfer protocol, whose deadlines end every transfer
-    (a receive's waiting timeout, then its failed-transfer acknowledgements or
-    deferred-release deadline; a send's room failing, a failed transfer worker
-    included). A long wait logs a warning every ``report_after`` seconds and
+    ``done`` answers only on proof that the engine stopped: a commit, the
+    transfer worker's report on a send with nothing it submitted left
+    running, or every prefill peer's drain acknowledgement of a failed
+    receive. A timeout or failure proves nothing, so a transfer whose proof
+    never comes (a dead peer, a transfer that timed out inside the engine) is
+    never done. A long wait logs a warning every ``report_after`` seconds and
     calls ``heartbeat`` every round, so the scheduler's watchdog sees a
     scheduler that is waiting. Past ``deadline`` seconds (by default
     SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT, else a minute past the
     protocol's own deadlines added up, so a healthy transfer is never cut) a
-    transfer the protocol never ended is a failure: each rank contributes, in the same reduced
+    transfer still running is a failure: each rank contributes, in the same reduced
     round, whether its wait is past the deadline, so every rank raises
     together, naming the transfers it still waits for, and no further
-    heartbeat hides the stall."""
+    heartbeat hides the stall. Only a move that cannot avoid such bytes
+    waits: the page ledger keeps them fenced, or QUARANTINED past a bound,
+    until the proof comes (`OrphanedTransferReaper`)."""
 
     def __init__(
         self,
@@ -309,6 +313,89 @@ class NetworkTransferWaiter:
                 )
                 reported = now
             time.sleep(self._interval)
+
+
+def kv_quarantine_timeout() -> float:
+    """Seconds an orphaned transfer stays unproven before its pages are
+    QUARANTINED (`SGLANG_DISAGGREGATION_KV_QUARANTINE_TIMEOUT`, by default four
+    release timeouts: well past the time a live peer takes to acknowledge)."""
+    timeout = envs.SGLANG_DISAGGREGATION_KV_QUARANTINE_TIMEOUT.get()
+    if timeout is None:
+        timeout = (
+            4 * envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+        )
+    return timeout
+
+
+class OrphanedTransferReaper:
+    """Releases the network transfers whose request is gone once their end is
+    proven, and quarantines those unproven past the bound, alike on every
+    rank (installed by whatever runs the transfers, polled once a step).
+
+    The request of a failed or aborted transfer is given back at once: its
+    rows are freed logically, and the page ledger keeps the bytes the
+    transfer may still touch fenced (`KVStorage.orphan_network_transfers`).
+    `resolve` judges each orphaned transfer on each rank (``done(peer)``, the
+    proof: the transfer worker's report on a send, or every peer's drain
+    acknowledgement of a receive) and whether it is still within
+    ``quarantine_after`` seconds, MIN-reduces both across ``groups`` (the ranks
+    that share the storage's layout, as the page-move waiter), and in that
+    round releases the proven ones and QUARANTINES the ones some rank sees
+    past the bound: their pages leave capacity and stay put until a late
+    proof releases them. Returns the peers released."""
+
+    def __init__(
+        self,
+        storage,
+        done: Callable[[Any], bool],
+        groups: Sequence[Optional[dist.ProcessGroup]],
+        *,
+        quarantine_after: float,
+    ):
+        self._storage = storage
+        self._done = done
+        self._groups = [g for g in groups if g is not None]
+        self._quarantine_after = quarantine_after
+
+    def resolve(self) -> List[Any]:
+        orphans = self._storage.orphaned_transfers()
+        if not orphans:
+            return []
+        now = time.monotonic()
+        flags = [int(bool(self._done(o.transfer.peer))) for o in orphans]
+        flags += [
+            int(o.quarantined or now - o.since < self._quarantine_after)
+            for o in orphans
+        ]
+        for group in self._groups:
+            flags = all_reduce_flags(flags=flags, group=group, op=dist.ReduceOp.MIN)
+        done, in_time = flags[: len(orphans)], flags[len(orphans) :]
+        released = []
+        for orphan, is_done, is_in_time in zip(orphans, done, in_time):
+            if is_done:
+                if orphan.quarantined:
+                    logger.warning(
+                        "Quarantined KV pages of request %s (room %s) are "
+                        "released: its transfer ended after %.0f s.",
+                        orphan.rid,
+                        orphan.room,
+                        now - orphan.since,
+                    )
+                self._storage.settle_orphaned_transfer(orphan)
+                released.append(orphan.transfer.peer)
+            elif not is_in_time:
+                self._storage.quarantine_orphaned_transfer(orphan)
+                logger.error(
+                    "KV pages of request %s (room %s) are quarantined after %.0f s: "
+                    "a transfer of it failed and its engine never proved it "
+                    "stopped. Its %d pages stay out of capacity and in place until "
+                    "it does, or until restart.",
+                    orphan.rid,
+                    orphan.room,
+                    now - orphan.since,
+                    orphan.page_count,
+                )
+        return released
 
 
 #########################

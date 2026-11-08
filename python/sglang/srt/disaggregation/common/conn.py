@@ -290,14 +290,30 @@ class DeferredAbortAckState(msgspec.Struct):
 
 
 class SendRecord:
-    """A room's sends queued for the transfer worker and finished by it, so a
-    page move can tell when the engine is done with one send's rows."""
+    """One room lifecycle's sends queued for the transfer worker and finished
+    by it, so a page move, or a release held for them, can tell when the
+    engine is done with one send's rows. Whatever waits for a send holds this
+    record itself, not the room: a report on a send of a room failed or
+    cleared since still reaches it, and a room started anew counts its sends
+    in a record of its own."""
 
-    __slots__ = ("queued", "finished")
+    __slots__ = ("queued", "finished", "unsettled")
 
     def __init__(self) -> None:
         self.queued = 0
         self.finished = 0
+        # Sends (by queue position) the worker finished with a transfer it
+        # submitted failing: the engine may still run that transfer, which
+        # nothing reports the end of.
+        self.unsettled: Set[int] = set()
+
+    def done(self, position: int) -> bool:
+        """Whether the engine is done with the send queued at ``position``:
+        none was queued there, or the worker finished it (sends finish in
+        queue order) with nothing it submitted left running."""
+        if self.queued <= position:
+            return True
+        return self.finished > position and position not in self.unsettled
 
 
 class CommonKVManager(BaseKVManager):
@@ -754,15 +770,28 @@ class CommonKVManager(BaseKVManager):
         self.send_record(bootstrap_room).queued += 1
 
     def note_send_finished(
-        self, bootstrap_room: int, record: Optional[SendRecord] = None
+        self,
+        bootstrap_room: int,
+        record: Optional[SendRecord] = None,
+        *,
+        settled: bool = True,
     ) -> None:
-        """The transfer worker is done with a queued send of the room: the
-        engine no longer touches its rows (worker thread). ``record`` is the
-        one the send was counted in. A room cleared since, or started anew,
-        has no such record and the report is dropped: nothing waits for it."""
-        current = (self._send_records or {}).get(bootstrap_room)
-        if current is not None and (record is None or record is current):
-            current.finished += 1
+        """The transfer worker is done with a queued send of the room (worker
+        thread), and with ``settled`` so is the engine: nothing it submitted
+        for the send is left running. Without, a transfer it submitted failed
+        or timed out and may still run: the send never counts as done, since
+        nothing will report that transfer's end. ``record`` is the one the
+        send was counted in, reported to even after the room was cleared or
+        started anew; without it, the room's current record."""
+        if record is None:
+            record = (self._send_records or {}).get(bootstrap_room)
+            if record is None:
+                return
+        if not settled:
+            # Before the count, so a reader never sees the send finished
+            # without seeing it unsettled.
+            record.unsettled.add(record.finished)
+        record.finished += 1
 
     def send_counts(self, bootstrap_room: int) -> Tuple[int, int]:
         """The room's sends queued and finished so far, in queue order."""
@@ -2575,10 +2604,11 @@ class CommonKVSender(BaseKVSender):
         )
 
     def _retire_sends(self) -> None:
-        """Drop the room's send record once nothing waits for its sends: the
-        room concluded or failed, and a failed room's sends count as done. A
-        report the worker makes later finds no record and is dropped. The
-        deferred abort ack keeps its own count of chunks in flight."""
+        """Drop the room's send record from the manager once the room
+        concluded or failed, so a room started anew counts its sends afresh.
+        Whatever still waits for a send holds the record itself, and the
+        worker reports a send it finishes later to that record. The deferred
+        abort ack keeps its own count of chunks in flight."""
         self.kv_mgr._forget_sends(self.bootstrap_room)
 
     def abort(self):

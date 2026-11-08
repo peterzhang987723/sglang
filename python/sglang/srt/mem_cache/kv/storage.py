@@ -9,7 +9,18 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+import time
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -54,12 +65,35 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
 class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's occupancy as observers report it, in its own units: tokens,
     or slots for a sub-pool that holds state. ``metrics`` is the family its
-    numbers are published under."""
+    numbers are published under. ``quarantined``: units out of capacity until
+    a network transfer that never proved it stopped is released."""
 
     name: str
     metrics: str
     capacity: int
     available: int
+    quarantined: int = 0
+
+
+class OrphanedTransfer:
+    """A network transfer whose request is gone before it was released: the
+    bytes it may still touch stay fenced, and QUARANTINED past a bound, until
+    proof of its end releases it (`KVStorage.settle_orphaned_transfer`)."""
+
+    __slots__ = ("transfer", "rid", "room", "since", "pages", "quarantined")
+
+    def __init__(self, transfer: NetworkTransfer, req, since: float, pages):
+        self.transfer = transfer
+        self.rid = getattr(req, "rid", None)
+        self.room = getattr(req, "bootstrap_room", None)
+        self.since = since
+        # The physical pages it touches, per member band (by sub-pool).
+        self.pages: Dict[str, Set[int]] = pages
+        self.quarantined = False
+
+    @property
+    def page_count(self) -> int:
+        return sum(len(pages) for pages in self.pages.values())
 
 
 class ResumeUnits(msgspec.Struct, frozen=True, kw_only=True):
@@ -109,6 +143,9 @@ class KVStorage:
         # Receive rows held for a destination publish still to come, per
         # request: their logical release.
         self._receive_holds: Dict[int, Tuple[Any, ReceiveHold]] = {}
+        # Transfers whose request is gone before their release, in the order
+        # orphaned (alike on every rank that records them).
+        self._orphaned: List[OrphanedTransfer] = []
         # Readers reaching a window further back than its own layers (a fused
         # draft's front rows), by sub-pool, and the length of a window the
         # model does not state: bound once at startup (`bind_window_retention`).
@@ -336,11 +373,12 @@ class KVStorage:
 
     def release_row(self, holder) -> None:
         """Give back the row of ``holder`` (a request, or a streaming
-        session's slot); its ids went back before. A request's network
-        transfers end here at the latest, and only its own: another request
-        with the same ``rid`` keeps its own. A session's slot has none, since
-        its request ended them when the row passed on."""
-        self.end_network_transfer(holder)
+        session's slot); its ids went back before. A network transfer of the
+        request not yet released is orphaned here (`orphan_network_transfers`):
+        only its own, never another request's with the same ``rid``. A
+        session's slot has none, since its request orphaned them when the row
+        passed on."""
+        self.orphan_network_transfers(holder)
         self.requests.free(holder)
 
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
@@ -645,6 +683,7 @@ class KVStorage:
                 metrics=s.external.metrics,
                 capacity=units[s.name][0],
                 available=units[s.name][1],
+                quarantined=self.quarantined_units(s.name),
             )
             for s in self._sub_pools
         )
@@ -969,10 +1008,85 @@ class KVStorage:
         if held is not None:
             held[1].released = True
 
+    def network_transfers(self, req: Req) -> List[NetworkTransfer]:
+        """``req``'s network transfers not yet released."""
+        _, transfers = self._network_transfers.get(_lifetime(req), (req, ()))
+        return [transfer for transfer in transfers if not transfer.released]
+
+    def orphan_network_transfers(self, req: Req) -> None:
+        """``req`` gives its rows back while transfers of it are not released
+        (it failed, was aborted, or concluded unproven): every rank reaches
+        this alike. Each one's bytes become fences in the page ledger
+        (`Band.fence_network_transfer`), so the pages are freed logically now
+        and written again only after its release, which proof of its end
+        decides (`settle_orphaned_transfer`). Reads the rows on the host:
+        never on a transfer that concluded, which `end_network_transfer`
+        releases first."""
+        self.end_receive_hold(req)
+        _, transfers = self._network_transfers.pop(_lifetime(req), (req, ()))
+        now = time.monotonic()
+        for transfer in transfers:
+            if transfer.released:
+                continue
+            pages = {}
+            for name, band in self._members():
+                touched = band.fence_network_transfer(transfer)
+                if touched:
+                    pages[name] = touched
+            self._orphaned.append(OrphanedTransfer(transfer, req, now, pages))
+
+    def orphaned_transfers(self) -> List[OrphanedTransfer]:
+        """Transfers orphaned and not yet released, in the order orphaned."""
+        return list(self._orphaned)
+
+    def settle_orphaned_transfer(self, orphan: OrphanedTransfer) -> None:
+        """Proof that ``orphan``'s engine stopped arrived on every rank: release
+        it, which ends its fences, and end its quarantine."""
+        orphan.transfer.released = True
+        self._orphaned = [o for o in self._orphaned if o is not orphan]
+        for _, band in self._members():
+            band.end_network_transfer_protection(orphan.transfer)
+
+    def quarantine_orphaned_transfer(self, orphan: OrphanedTransfer) -> None:
+        """``orphan`` stayed unproven past the bound on some rank: QUARANTINE
+        its pages (`Band.quarantine_network_transfer`) until its release."""
+        if orphan.quarantined:
+            return
+        orphan.quarantined = True
+        members = dict(self._members())
+        for name, pages in orphan.pages.items():
+            members[name].quarantine_network_transfer(orphan.transfer, pages)
+
+    def has_unreleased_network_transfers(self) -> bool:
+        """Whether some network transfer may still touch the pool: one of a
+        live request not yet released, or an orphaned one."""
+        return bool(self._orphaned) or any(
+            not t.released for _, ts in self._network_transfers.values() for t in ts
+        )
+
+    def quarantined_units(self, sub_pool: str) -> int:
+        """Units of ``sub_pool`` QUARANTINED for unproven transfers."""
+        bands = dict(self._members())
+        if sub_pool not in bands:
+            return 0
+        band = bands[sub_pool]
+        if sub_pool == self._allocator.roles.state:
+            return band.quarantined_page_count()
+        return band.quarantined_page_count() * band.page_size
+
+    def _members(self):
+        """Every member band holding transfer rows, by sub-pool."""
+        roles = self._allocator.roles
+        names = [roles.owner, *self._allocator.window_allocators]
+        if roles.state is not None:
+            names.append(roles.state)
+        return [(name, self._member(name)) for name in names]
+
     def end_network_transfer(self, req: Req) -> None:
-        """The request's network transfers ended, or its row is released (the
-        release point of a failed transfer): every rank reaches this alike.
-        Only ``req``'s own: a request reusing its ``rid`` keeps its own."""
+        """The request's network transfers ended: every rank reaches this
+        alike, once the engine is done with them (a commit, or a send whose
+        room concluded). Only ``req``'s own: a request reusing its ``rid``
+        keeps its own."""
         self.end_receive_hold(req)
         _, transfers = self._network_transfers.pop(_lifetime(req), (req, ()))
         for transfer in transfers:

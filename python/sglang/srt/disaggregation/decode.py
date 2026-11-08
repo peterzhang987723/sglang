@@ -68,6 +68,7 @@ from sglang.srt.disaggregation.utils import (
     KVClassType,
     MetadataBuffers,
     NetworkTransferWaiter,
+    OrphanedTransferReaper,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
@@ -83,6 +84,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     kv_layout_signature,
+    kv_quarantine_timeout,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -3117,6 +3119,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     enable_host_receive: bool = False
+    # Whether a failed device receive's request is given back at once, its
+    # rows kept out of reuse by the page ledger until every prefill peer
+    # acknowledges its drain (unified memory). A static pool holds the request
+    # instead, until the drain or the release timeout.
+    fences_failed_receives: bool = False
+    # Releases a failed receive whose request is gone once drained
+    # (`OrphanedTransferReaper`).
+    transfer_reaper: Optional[OrphanedTransferReaper] = None
 
     def __init__(
         self,
@@ -3150,23 +3160,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
+        self.fences_failed_receives = get_memory().enable_unified_memory
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries:
         # (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
+        # Failed receives given back before their drain, entries as held
+        # releases' (decode_req, start_time, None, metadata_idx, required_acks):
+        # their receiver and metadata slot stay until the drain.
+        self._undrained_receives: List[tuple] = []
         # A page move that cannot avoid a row a receive writes waits, on the
         # host, until every rank's receive is done writing it.
-        kv_storage_of(
+        storage = kv_storage_of(
             tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
-        ).set_network_waiter(
+        )
+        storage.set_network_waiter(
             NetworkTransferWaiter(
                 self._receive_done,
                 (self.gloo_group,),
                 heartbeat=self.scheduler.feed_watchdog,
             )
         )
+        if self.fences_failed_receives:
+            self.transfer_reaper = OrphanedTransferReaper(
+                storage,
+                self._receive_done,
+                (self.gloo_group,),
+                quarantine_after=kv_quarantine_timeout(),
+            )
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
@@ -3639,13 +3662,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             op=torch.distributed.ReduceOp.MAX,
         )
         for (i, decode_req, _), hold in zip(failed, held):
-            if hold:
+            if (
+                hold
+                and self.fences_failed_receives
+                and not self._is_host_destination(decode_req)
+            ):
+                self._release_undrained(decode_req)
+                deferred_indices.add(i)
+            elif hold:
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
-                # FIXME: without deferred release, a failed receive's device
-                # destination is released at once, with no proof that the
-                # remote writer stopped; a late write can land in reused pages.
+                # No peer was sent this destination, or deferred release is off,
+                # which unified memory refuses at startup.
+                # FIXME: a static pool without deferred release releases a
+                # failed receive's device destination at once, with no proof
+                # that the remote writer stopped; a late write can land in
+                # reused pages.
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
@@ -3744,31 +3777,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return self._failed_receive_quiescent(decode_req)
 
     def _failed_receive_quiescent(self, decode_req: DecodeRequest) -> bool:
-        """Whether no prefill rank still writes a failed receive's rows, by the
-        rule deferred release keeps (`resolve_deferred_releases`): its hold's
-        acknowledgements and deadline once it is held. Before the hold, a
-        destination sent to the peers is owed an acknowledgement by every
-        bootstrap peer, whether or not decode has notified the abort yet, so
-        the abort is notified here; the deadline runs from this first sight
-        and the hold keeps it. Without deferred release the queue releases a
-        failed receive at once, and so does this."""
-        # FIXME: neither the deadline nor a release without deferred release
-        # proves that the remote writer stopped. Through `_receive_done` this is
-        # the allocator's network waiter, so the rows can be moved or reused
-        # while a late write still lands in them.
+        """Whether no prefill rank still writes a failed receive's rows, on
+        proof only: no peer was sent the destination, or every peer sent it
+        acknowledged its drain (the proof that releases its transfer, or a
+        static pool's held rows). A destination sent to the peers is owed an
+        acknowledgement by every bootstrap peer, whether or not decode has
+        notified the abort yet, so the abort is notified here. A timeout
+        proves nothing: a peer that never acknowledges (a dead one, or one
+        whose transfer timed out inside its engine) keeps the receive
+        running, and a page move that cannot avoid its rows waits for it."""
         receiver = decode_req.kv_receiver
-        if not (
-            self.enable_deferred_kv_release
-            and receiver.kv_mgr.enable_deferred_decode_kv_release
-        ):
-            return True
         if self._is_host_destination(decode_req):
             return receiver.is_abort_release_safe()
         hold = next(
-            (e for e in self._deferred_releases.items() if e[0] is decode_req), None
+            (
+                e
+                for e in (*self._deferred_releases.items(), *self._undrained_receives)
+                if e[0] is decode_req
+            ),
+            None,
         )
         if hold is not None:
-            _, _, deadline, _, required_acks = hold
+            required_acks = hold[4]
         elif decode_req.awaiting_publish or decode_req.pending_metadata is not None:
             return True  # no peer has these rows' addresses
         else:
@@ -3776,22 +3806,66 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             required_acks = len(getattr(receiver, "bootstrap_infos", None) or ())
             if decode_req.receive_failed_at is None:
                 decode_req.receive_failed_at = time.monotonic()
-            deadline = decode_req.receive_failed_at + self.deferred_kv_release_timeout
-        # Once the deadline passes the answer stays true, so ranks that saw
-        # the failure at different times still agree in the waiter's reduction.
-        return (
-            receiver.kv_mgr.is_abort_release_safe(
-                decode_req.req.bootstrap_room, required_acks
-            )
-            or time.monotonic() >= deadline
+        # Without deferred release no peer acknowledges a drain: never proven.
+        return receiver.kv_mgr.is_abort_release_safe(
+            decode_req.req.bootstrap_room, required_acks
         )
 
+    def _release_undrained(self, decode_req: DecodeRequest) -> None:
+        """Give a failed receive's request back now, its drain still owed: its
+        receive transfer is orphaned, so the page ledger keeps the rows it may
+        write fenced until the drain releases it (`transfer_reaper`). The
+        receiver, which counts the acknowledgements, and the metadata slot,
+        which a late write may also reach, stay until then."""
+        storage = kv_storage_of(
+            self.tree_cache.req_to_token_pool,
+            self.tree_cache.token_to_kv_pool_allocator,
+        )
+        # A rank that never published these rows has no transfer to wait for.
+        owed = bool(storage.network_transfers(decode_req.req))
+        start_time = decode_req.receive_failed_at
+        if start_time is None:
+            start_time = time.monotonic()
+        entry = (
+            decode_req,
+            start_time,
+            None,
+            decode_req.metadata_buffer_index,
+            self._required_abort_acks(decode_req),
+        )
+        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        if owed:
+            self._undrained_receives.append(entry)
+        else:
+            self._finish_release(decode_req, decode_req.metadata_buffer_index)
+
+    def _resolve_undrained_receives(self) -> None:
+        """Release the orphaned receives proven drained (and quarantine those
+        unproven past the bound), alike on every rank; finish their requests'
+        receivers and metadata slots."""
+        if self.transfer_reaper is None:
+            return
+        released = {id(peer) for peer in self.transfer_reaper.resolve()}
+        if not released:
+            return
+        done = [e for e in self._undrained_receives if id(e[0]) in released]
+        self._undrained_receives = [
+            e for e in self._undrained_receives if id(e[0]) not in released
+        ]
+        for decode_req, _, _, idx, _ in done:
+            self._finish_release(decode_req, idx)
+
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        # release pre-allocated kv cache, but don't insert into the tree since it's failed
+        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        self._finish_release(decode_req, idx)
+
+    def _finish_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        """Free a failed receive's metadata slot and receiver: no peer writes
+        them any more."""
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
-        # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -3815,10 +3889,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
     def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
-        # FIXME: a device destination released at its deadline has no proof
-        # that the remote writer stopped. Its pages can then be handed out
-        # again while a late write still lands in them.
+        """Release drained transfers: the receives orphaned with their rows
+        fenced (unified memory), and the held releases. A held device
+        destination (a static pool's) also goes at its deadline."""
+        # FIXME: a static pool's device destination released at its deadline
+        # has no proof that the remote writer stopped. Its pages can then be
+        # handed out again while a late write still lands in them.
+        self._resolve_undrained_receives()
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -3884,6 +3961,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
+        self._undrained_receives.clear()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""

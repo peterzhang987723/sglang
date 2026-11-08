@@ -2624,10 +2624,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         batch_transfer_sync returns -1 on its wall-clock timeout with the batch
         still running (freeBatchID refuses a busy batch and the handle is
-        dropped), so a failed send may still be writing decode's pages; decode
-        falls back to its release timeout instead."""
+        dropped), so a failed send may still be writing decode's pages: with
+        no acknowledgement decode keeps them (a static pool's go at its release
+        timeout)."""
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
+
+    def _report_unsettled_send(self, room: int) -> None:
+        """A send whose submitted transfer failed may still read its source
+        rows, and nothing reports when the engine stops: the page ledger keeps
+        them out of reuse, quarantined past the bound."""
+        logger.error(
+            "A KV transfer of room %s failed after it was submitted; the "
+            "transfer engine may still be reading its source pages, which the "
+            "page ledger keeps out of reuse (quarantined once past "
+            "SGLANG_DISAGGREGATION_KV_QUARANTINE_TIMEOUT) until restart.",
+            room,
+        )
 
     def transfer_worker(
         self,
@@ -2646,6 +2659,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            # Whether this chunk may have handed the engine a transfer, and
+            # whether one it handed over failed or timed out: Mooncake then
+            # drops the batch handle with the batch possibly still running
+            # (freeBatchID refuses a busy batch), so nothing reports its end.
+            submitted = unsettled = False
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2700,6 +2718,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    # Skipped: the engine never read its rows.
+                    self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2762,6 +2782,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 bootstrap_room=kv_chunk.room, failure_reason=str(exc)
                             )
                             break
+                        # From here on the chunk may hand the engine work.
+                        submitted = True
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2900,6 +2922,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
+                            unsettled = True
                             self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
@@ -2921,6 +2944,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # Before the Failed check: an ABORT during the
                                 # send also marks the room Failed.
                                 if state_rc != 0:
+                                    unsettled = True
                                     self._poison_unsettled_send(kv_chunk.room)
                                 if (
                                     self.request_status.get(
@@ -3001,7 +3025,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # counts it: the decrement and the report find nothing.
                 if kv_chunk.room in self._staging_outstanding:
                     self._staging_outstanding[kv_chunk.room] -= 1
-                self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
+                if unsettled:
+                    self._report_unsettled_send(kv_chunk.room)
+                self.note_send_finished(
+                    kv_chunk.room, kv_chunk.send_record, settled=not unsettled
+                )
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3038,11 +3066,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
-                    # This worker stops: its room concludes failed, so nothing
-                    # waits for a send it will never finish (a failed room's
-                    # send counts as done, `prefill._send_done`).
+                    # This worker stops: its room concludes failed, and the
+                    # send is finished here. Once it may have handed the
+                    # engine work, which may still run, it is unsettled.
                     self.record_failure(kv_chunk.room, f"Transfer worker failed: {e}")
                     self.update_status(kv_chunk.room, KVPoll.Failed)
+                    if submitted:
+                        self._report_unsettled_send(kv_chunk.room)
+                    self.note_send_finished(
+                        kv_chunk.room,
+                        getattr(kv_chunk, "send_record", None),
+                        settled=not submitted,
+                    )
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )

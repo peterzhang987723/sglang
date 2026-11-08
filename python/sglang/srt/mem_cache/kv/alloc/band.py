@@ -34,6 +34,7 @@ import functools
 import inspect
 import logging
 import os
+import sys
 from typing import (
     Dict,
     Generic,
@@ -68,11 +69,13 @@ from sglang.srt.mem_cache.kv.alloc.invariants import (
     HOST_READ_BEFORE_WAIT,
 )
 from sglang.srt.mem_cache.kv.alloc.page_usage import (
+    VACATED,
     Clearance,
     Consumer,
     PageUsage,
 )
 from sglang.srt.mem_cache.kv.alloc.signals import (
+    NetworkTransfer,
     NetworkWaiter,
     ReceiveHold,
     StreamTransfer,
@@ -637,6 +640,11 @@ class Band:
         # transfers, and pages a move vacated while readers could still read
         # them (`PageUsage`).
         self.usage = PageUsage()
+        # QUARANTINED pages, by the network transfer that may still touch them
+        # (`quarantine_network_transfer`): out of the free list and fixed in
+        # place until the transfer is released.
+        self._quarantined: Dict[int, Tuple[TransferRelease, Set[int]]] = {}
+        self._quarantined_pages: Set[int] = set()
         # Move batches that may have moved a held receive row (one issued
         # while a hold is open).
         self.held_row_moves = 0
@@ -743,7 +751,16 @@ class Band:
             self.watermark_physical = self.num_pages - 1
 
     def clear(self) -> None:
-        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+        """Reset to initial state. Pages in `[0, min_page_index)` are reserved.
+
+        While a network transfer that is not released may still touch some of
+        its bytes (a fence or a pending page keyed by it, or a quarantined
+        page), the band frees every page instead and keeps that protection
+        (`_clear_keeping_network_transfers`): a reset would hand those bytes
+        out."""
+        if self._holds_unreleased_network_transfer():
+            self._clear_keeping_network_transfers()
+            return
         self._reset_watermarks()
         self.ids.reset()
         if self.is_id_owner:
@@ -773,6 +790,54 @@ class Band:
         self._pending_host = []
         self.usage.reset()
         self._capacity_epoch += 1  # fixed pages are capacity-bearing
+
+    def _holds_unreleased_network_transfer(self) -> bool:
+        if self._quarantined:
+            return True
+        return any(
+            isinstance(key, NetworkTransfer) and not key.released
+            for use in self.usage.uses
+            for key in keys_of(use.release if use.release is not None else use.signal)
+        )
+
+    def _clear_keeping_network_transfers(self) -> None:
+        """A clear that frees every page through the one release path instead
+        of resetting the band: pages pending on a forward (none is in flight
+        at a clear) and every live page go back, and the ledger keeps what
+        protects bytes an unreleased network transfer may touch, so they are
+        neither handed out nor moved over. The geometry stays; compaction
+        retreats it later."""
+        steps = self.forward_steps
+        assert steps is None or not steps.in_flight(), (
+            f"{self.sub_pool_name}: a clear with a forward in flight"
+        )
+        ready, _ = self._pending_until_retire.processed_through(sys.maxsize)
+        self._pending_until_retire = NO_PENDING_PAGES
+        host = self._pending_host
+        self._pending_host = []
+        if ready:
+            self.release(ready, Release.FREE, host=host)
+        bound = self.ids.physical_to_virtual[self.min_page_index : self.num_pages]
+        live = torch.nonzero(bound >= 0).flatten() + self.min_page_index
+        if live.numel():
+            self.free_physical(self._expand_pages_to_tokens(live))
+        self.live_page_count = 0
+        self.ids.reset()
+        if self.is_id_owner:
+            self.free_virtual_ids = torch.arange(
+                self.min_page_index,
+                self.num_pages,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            self.free_virtual_ids = None
+        self.free_group = None
+        self.free_page_reps_group = None
+        self._inverse_history.clear()
+        self.usage.prune()
+        self._holes_dirty = True
+        self._capacity_epoch += 1
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
@@ -1256,9 +1321,46 @@ class Band:
     def fixed_pages(self) -> Set[int]:
         return self.usage.fixed_pages()
 
+    def _network_fenced_pages(self) -> Set[int]:
+        """Pages whose bytes a fence of an unreleased network transfer covers:
+        the frontier never retreats past one, so a take reaches it only as a
+        hole chosen last, never as growth it cannot avoid. Host arithmetic."""
+        epp = self.entry_bytes_per_page
+        out: Set[int] = set()
+        for use in self.usage.uses:
+            if (
+                use.kind == VACATED
+                and use.pages is None
+                and any(
+                    isinstance(key, NetworkTransfer) and not key.released
+                    for key in keys_of(use.signal)
+                )
+            ):
+                out.update(range(use.lo // epp, -(-use.hi // epp)))
+        return out
+
+    def _network_fenced_hole_count(self) -> int:
+        """Holes an unreleased network transfer's fence covers. Reads the free
+        list on the host only while such a fence exists (a failed transfer not
+        yet proven done), before any wait of the operation."""
+        fenced = self._network_fenced_pages()
+        if not fenced:
+            return 0
+        self._read_ahead_geometry()
+        op = self._operation
+        if op is not None:
+            op.geometry.add(id(self))
+        return sum(1 for page in self._free_pages_snapshot() if page in fenced)
+
+    def _kept_in_span(self) -> Set[int]:
+        """Pages the span keeps covering, free or not: fixed ones, and those an
+        unreleased network transfer's fence covers."""
+        return self.fixed_pages() | self._network_fenced_pages()
+
     def fixed_extent(self) -> Optional[Tuple[int, int]]:
-        """Pages ``[first, end)`` spanning every fixed page, or None."""
-        pages = self.fixed_pages()
+        """Pages ``[first, end)`` spanning every page kept in the span (fixed,
+        or under an unreleased network transfer's fence), or None."""
+        pages = self._kept_in_span()
         return (min(pages), max(pages) + 1) if pages else None
 
     def _credit_neighbors(self) -> tuple:
@@ -1363,8 +1465,22 @@ class Band:
             consumers = self._consumers(consumer)
             free = int(self._free_phys_pages.shape[0])
             pending = self._pending_until_retire
-            short = num_pages - min(num_pages, free)
+            # Holes an unreleased network transfer's fence covers serve a take
+            # only when the frontier cannot: taking one waits for the transfer.
+            fenced = self._network_fenced_hole_count() if free else 0
+            usable = free - fenced
+            short = num_pages - min(num_pages, usable)
             need_more = max(0, short - pending.count)
+            if (
+                fenced
+                and need_more > 0
+                and not self._frontier_fits(
+                    need_more, placement, usable + pending.count
+                )
+            ):
+                usable = free
+                short = num_pages - min(num_pages, usable)
+                need_more = max(0, short - pending.count)
             settles = short > 0 and bool(pending)
             if need_more > 0 and (
                 (planned and placement is None)
@@ -1377,7 +1493,10 @@ class Band:
                 # Whole oldest batches (the operation reads ahead before the
                 # settle's wait, `settle_pending`); a float keeps its span (no park).
                 self.settle_pending(through=pending.batches_for(short))
-            n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
+            n_drain = min(
+                num_pages,
+                int(self._free_phys_pages.shape[0]) - (free - usable),
+            )
             # Extend, then take holes; every host read before the first wait.
             extension = None
             if need_more > 0:
@@ -2036,11 +2155,18 @@ class Band:
         writes)``, with ``host`` naming the pages) are transfers still on the
         pages; they fence them for `acquire` to clear. The per-step `free`
         passes none: a host copy runs only over rows its owner keeps locked
-        until it ends, and a network transfer's rows are freed only once it is
-        released. No device read."""
+        until it ends, and a network transfer whose owner is gone first fenced
+        its bytes (`fence_network_transfer`). A QUARANTINED page is withheld
+        instead (`quarantine_network_transfer`). No device read, but for a
+        quarantined band without ``host``."""
         parts = [pages] if isinstance(pages, torch.Tensor) else list(pages)
         if sum(part.numel() for part in parts) == 0:
             return
+        if self._quarantined_pages:
+            # A QUARANTINED page never joins the free list (rare: a host read).
+            parts, host = self._divert_quarantined(parts, host)
+            if not host:
+                return
         known = self._host_free
         self._free_pages = torch.cat([self._free_phys_pages, *parts])
         if known is None or host is None:
@@ -2283,6 +2409,106 @@ class Band:
                 )
                 for use in transfers
             ]
+
+    # -- network transfers whose owner is gone --
+
+    def fence_network_transfer(self, transfer: NetworkTransfer) -> Set[int]:
+        """The rows of ``transfer`` lose their owner before it is released:
+        turn what it reads or writes into fences over those bytes, so whatever
+        page they belong to next (freed now, freed later by the tree, or moved
+        away and reused) is written only once the transfer is released (a take
+        chooses such holes last and waits for them on the host). Returns the
+        physical pages it touches. Reads their ids on the host."""
+        uses = [use for use in self.usage.transfers() if use.release is transfer]
+        if not uses:
+            return set()
+        touched: Set[int] = set()
+        for use in uses:
+            pages = self._use_physical_pages(use)
+            touched |= pages
+            self.usage.vacate(
+                transfer,
+                list(_page_runs(sorted(pages))),
+                page_bytes=self.entry_bytes_per_page,
+                writes=use.writes,
+            )
+        self.usage.uses = [
+            use for use in self.usage.uses if not any(use is u for u in uses)
+        ]
+        self._capacity_epoch += 1
+        return touched
+
+    def quarantine_network_transfer(
+        self, transfer: NetworkTransfer, pages: Set[int]
+    ) -> None:
+        """QUARANTINE ``pages`` for ``transfer``, never proven to have stopped:
+        they leave capacity and stay where they are until it is released.
+        Holes among them leave the free list now, and pages freed later
+        (`release`) never join it; every one is fixed, so no move goes over or
+        away from it and the frontier keeps it inside the band. Reads the free
+        list on the host."""
+        pages = set(pages)
+        if not pages:
+            return
+        self._quarantined[id(transfer)] = (transfer, pages)
+        self._quarantined_pages |= pages
+        self.fix_pages(transfer, sorted(pages))
+        free = self._free_pages_snapshot()
+        holes = sorted(pages.intersection(free))
+        if holes:
+            taken = set(holes)
+            rest = [page for page in free if page not in taken]
+            self._set_free_pages(
+                torch.tensor(rest, dtype=torch.int64, device=self.device), host=rest
+            )
+            self._withhold(transfer, holes)
+        self._holes_dirty = True
+        self._capacity_epoch += 1
+
+    def end_network_transfer_protection(self, transfer: NetworkTransfer) -> None:
+        """``transfer`` was released: its fences end, the span may retreat
+        over their pages, and quarantined pages may move again and join the
+        free list at the next drain (their key ended)."""
+        self._holes_dirty = True
+        self._capacity_epoch += 1
+        entry = self._quarantined.pop(id(transfer), None)
+        if entry is None:
+            return
+        self._quarantined_pages = set().union(
+            *(pages for _, pages in self._quarantined.values())
+        )
+        self.unfix_pages(transfer)
+        self._holes_dirty = True
+        self._capacity_epoch += 1
+
+    def quarantined_page_count(self) -> int:
+        return len(self._quarantined_pages)
+
+    def _withhold(self, transfer: NetworkTransfer, pages: List[int]) -> None:
+        """Keep free ``pages`` out of the free list as pending under
+        ``transfer``: they return once it is released (and unfixed)."""
+        self.usage.vacate(
+            transfer,
+            (),
+            page_bytes=self.entry_bytes_per_page,
+            pages=pages,
+            batch=torch.tensor(pages, dtype=torch.int64, device=self.device),
+        )
+
+    def _divert_quarantined(self, parts: List[torch.Tensor], host: Optional[List[int]]):
+        """Split pages on their way to the free list: quarantined ones are
+        withheld under their transfer instead. Returns the rest, as tensors
+        and on the host. Reads the pages on the host when ``host`` is None."""
+        if host is None:
+            host = torch.cat(parts).tolist()
+        if self._quarantined_pages.isdisjoint(host):
+            return parts, host
+        kept = [page for page in host if page not in self._quarantined_pages]
+        for transfer, pages in self._quarantined.values():
+            withheld = [page for page in host if page in pages]
+            if withheld:
+                self._withhold(transfer, withheld)
+        return [torch.tensor(kept, dtype=torch.int64, device=self.device)], kept
 
     def _pages_of_units(self, units, unit_tokens: int) -> Set[int]:
         """The physical PAGE ids physical ``units`` of ``unit_tokens`` tokens
@@ -2567,7 +2793,7 @@ class Band:
         """
         M = len(all_cpu)
         wm = self.watermark_physical
-        fixed = self.fixed_pages()
+        fixed = self._kept_in_span()
         n = 0
         if self.grow_direction == "up":
             while (
@@ -2670,9 +2896,11 @@ class Band:
             latest_event = self.usage.latest_forward
 
             # The frontier an urgent pass leaves: just past the live pages packed
-            # from the base, or past the farthest fixed page if that is farther.
-            # Every survivor beyond it moves into a hole below it; none is fixed.
-            fixed = self.fixed_pages()
+            # from the base, or past the farthest page kept in the span (fixed,
+            # or under an unreleased network transfer's fence) if that is
+            # farther. Every survivor beyond it moves into a hole below it; none
+            # is fixed.
+            fixed = self._kept_in_span()
             if self.grow_direction == "up":
                 live = new_wm - self.min_page_index - len(holes_cpu)
                 packed_end = self.min_page_index + live
@@ -3250,9 +3478,10 @@ class FloatBand(Band):
 
     def _is_frontier_transparent(self) -> bool:
         # A fixed page keeps the span where it is, free or not, and so does a
-        # page pending until its step is processed: the float stays opaque over
-        # them, as every plan assumes, until they are settled.
-        return self._occupied_pages() == 0 and not self.fixed_pages()
+        # page pending until its step is processed or covered by an unreleased
+        # network transfer's fence: the float stays opaque over them, as every
+        # plan assumes, until they are settled.
+        return self._occupied_pages() == 0 and not self._kept_in_span()
 
     def _allocated_pages(self) -> int:
         # Live pages: a take reuses the pending ones before it grows.
@@ -3578,8 +3807,9 @@ class FloatBand(Band):
         self._holes_dirty = False
         before = self._span_pages()
         holes = set(self._free_pages_snapshot())
-        # The span never shrinks past a fixed page, free or not.
-        fixed = self.fixed_pages()
+        # The span never shrinks past a fixed page, free or not, nor past one an
+        # unreleased network transfer's fence covers.
+        fixed = self._kept_in_span()
         changed = False
         while self.low_wm_page in holes and self.low_wm_page not in fixed:
             holes.remove(self.low_wm_page)
