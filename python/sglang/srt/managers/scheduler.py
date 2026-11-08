@@ -341,6 +341,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.capacity import decided_reading
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
@@ -2286,6 +2287,7 @@ class Scheduler(
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        self._pp_begin_capacity_round()
         recv_reqs = self.pause_state.take_inputs(
             received_reqs, stop_at_pause=stop_at_pause
         )
@@ -4366,8 +4368,10 @@ class Scheduler(
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
-            max_pool_usage = (
-                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+            max_pool_usage = decided_reading(
+                self.token_to_kv_pool_allocator,
+                "max_pool_usage",
+                lambda: self.pool_stats_observer.get_pool_stats().get_max_pool_usage(),
             )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=max_pool_usage

@@ -37,6 +37,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # Ids handed out index a virtual space the allocator translates to physical
     # rows (a unified pool's chain), not the pool's rows themselves.
     hands_out_virtual_ids = False
+    # Under pipeline parallelism, the first stage's answers to this allocator's
+    # capacity questions (`StageCapacity`); None where each stage decides alone.
+    stage_capacity = None
     # A request's recurrent state and its slots, when the model has them; the
     # KV cache configurator binds the request table's.
     state: Optional[StateStorage] = None

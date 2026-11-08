@@ -19,7 +19,8 @@ discipline; none reads the allocator's declaration itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping, Optional
+from contextlib import contextmanager, nullcontext
+from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Optional, TypeVar
 
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
@@ -228,3 +229,25 @@ def windows_share_owner_memory(allocator) -> bool:
     """Whether ``allocator``'s windows take their rows from the owner's memory,
     so a budget over the owner prices them too."""
     return discipline(allocator).windows_share_owner_memory(allocator)
+
+
+_T = TypeVar("_T")
+
+
+@contextmanager
+def observing(allocator) -> Iterator[None]:
+    """Capacity reads that decide nothing (metrics, load reports, logs). Under
+    pipeline parallelism a stage may make them where another does not, so each
+    stage answers them from its own memory."""
+    capacity = allocator.stage_capacity
+    with nullcontext() if capacity is None else capacity.observing():
+        yield
+
+
+def decided_reading(allocator, name: str, read: Callable[[], _T]) -> _T:
+    """A value read from observed capacity (`observing`) that a decision rests
+    on: under pipeline parallelism every stage takes the first stage's."""
+    capacity = allocator.stage_capacity
+    if capacity is None:
+        return read()
+    return capacity.decide(name, None, read)

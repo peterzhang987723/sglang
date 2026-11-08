@@ -20,6 +20,9 @@ from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.pp_capacity_relay import (
+    PPCapacityRelay,
+)
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -27,6 +30,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -109,6 +113,9 @@ class SchedulerPPMixin:
     # Records a skipped output's completion behind the unified pool's forward
     # (`_pp_make_skip_output_result`); made on first use.
     _pp_skip_output_stream = None
+    # Unified memory under pipeline parallelism: carries the first stage's
+    # capacity decisions to the later stages (`init_pp_loop_state`).
+    _pp_capacity_relay: Optional[PPCapacityRelay] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -153,7 +160,11 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self._pp_ingest_requests()
-                if not self.pp_group.is_last_rank:
+                # The first stage's capacity decisions span the whole
+                # iteration, result processing included, so a capacity relay
+                # sends the requests with them at the iteration's end.
+                relays_capacity = self._pp_capacity_relay is not None
+                if not self.pp_group.is_last_rank and not relays_capacity:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
@@ -219,7 +230,12 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                self._pp_end_capacity_round(cur_batch)
                 if not self.pp_group.is_last_rank:
+                    if relays_capacity:
+                        self._pp_commit_comm_work(self.send_req_work)
+                        self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                        self._pp_relay_capacity()
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
@@ -367,8 +383,10 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
+                self._pp_end_capacity_round(cur_batch)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_relay_capacity()
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -554,8 +572,10 @@ class SchedulerPPMixin:
                         self._on_step_processed(self.mbs[next_mb_id], None)
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
+                self._pp_end_capacity_round(cur_batch)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_relay_capacity()
                     if may_launch:
                         send_retract_work = self._pp_send_pyobj_to_next_stage(
                             retract_rids, async_send=True
@@ -657,6 +677,70 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        self._pp_capacity_relay = self._pp_init_capacity_relay()
+
+    def _pp_init_capacity_relay(self: Scheduler) -> Optional[PPCapacityRelay]:
+        """Under unified memory, make the first stage decide every stage's
+        capacity: every stage shares its geometry, as sized after capture."""
+        allocator = self.token_to_kv_pool_allocator
+        if get_parallel().pp_size == 1 or not isinstance(allocator, ChainAllocator):
+            return None
+        if self.recv_skipper is not None:
+            raise ValueError(
+                "unified memory under pipeline parallelism relays capacity "
+                "decisions with every round's requests; it needs "
+                "--scheduler-recv-interval 1"
+            )
+        geometries = [None] * get_parallel().pp_size
+        torch.distributed.all_gather_object(
+            geometries, allocator.stage_geometry(), group=self.pp_group.cpu_group
+        )
+        allocator.install_stage_capacity(get_parallel().pp_rank, geometries)
+        logger.info(
+            "Unified memory capacity decided by the first pipeline stage for "
+            "stage arenas of %s bytes",
+            [geometry.total_bytes for geometry in geometries],
+        )
+        return PPCapacityRelay(
+            allocator=allocator,
+            is_last_stage=self.pp_group.is_last_rank,
+            send=lambda data: self._pp_send_pyobj_to_next_stage(data, async_send=True),
+            recv=self._pp_recv_pyobj_from_prev_stage,
+            commit=self._pp_commit_comm_work,
+        )
+
+    def _pp_begin_capacity_round(self: Scheduler) -> None:
+        """Called once the round's requests are received, before any of them
+        is processed."""
+        if self._pp_capacity_relay is not None:
+            self._pp_capacity_relay.round_begin(self.tree_cache)
+
+    def _pp_end_capacity_round(self: Scheduler, batch: Optional[ScheduleBatch]):
+        if self._pp_capacity_relay is not None:
+            self._pp_capacity_relay.round_end(lambda: self._pp_capacity_outcome(batch))
+
+    def _pp_relay_capacity(self: Scheduler) -> None:
+        if self._pp_capacity_relay is not None:
+            self._pp_capacity_relay.relay()
+
+    def _pp_capacity_outcome(self: Scheduler, batch: Optional[ScheduleBatch]):
+        """A round's result as the stages compare it: the batch launched, the
+        running and waiting requests, the chunked request and the decode
+        token ratio."""
+        launched = None
+        if batch is not None:
+            launched = (
+                batch.forward_mode.name,
+                tuple(req.rid for req in batch.reqs),
+                tuple(batch.extend_lens) if batch.forward_mode.is_extend() else (),
+            )
+        return (
+            launched,
+            tuple(req.rid for req in self.running_batch.reqs),
+            tuple(req.rid for req in self.waiting_queue),
+            None if self.chunked_req is None else self.chunked_req.rid,
+            self.new_token_ratio_tracker.current,
+        )
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()

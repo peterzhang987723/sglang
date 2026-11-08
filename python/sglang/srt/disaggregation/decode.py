@@ -123,6 +123,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     evictable_by_sub_pool,
     window_sub_pool_of,
 )
+from sglang.srt.mem_cache.capacity import decided_reading
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     discard_kv_cache_backup,
@@ -1752,7 +1753,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and not decode_req.is_rebootstrap
                 and not _is_fake_transfer(decode_req.req)
                 and decode_req.kv_receiver.supports_host_destination
-                and self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
+                and decided_reading(
+                    self.token_to_kv_pool_allocator,
+                    "full_token_usage",
+                    lambda: (
+                        self.scheduler.pool_stats_observer.get_pool_stats().full_token_usage
+                    ),
+                )
                 >= get_disagg().disaggregation_decode_host_receive_threshold
             ):
                 if not self._pre_alloc_host(decode_req):

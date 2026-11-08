@@ -259,24 +259,50 @@ def admission_worker(rank, path):
                     _resize_cpu_storage(storage, config)
                     assert config.max_total_num_tokens < initial.max_total_num_tokens
                 input_tokens = config.max_total_num_tokens // 3 + 8
+                alone = _admission(allocator, input_tokens, 8)
+                # Every stage shares its geometry as sized now, after the
+                # resize too; the first stage then decides for both.
+                geometries = [None, None]
+                dist.all_gather_object(geometries, allocator.stage_geometry())
+                allocator.install_stage_capacity(rank, geometries)
+                capacity = allocator.stage_capacity
+                decisions = [None]
+                if rank == 0:
+                    capacity.begin()
+                    decided = _admission(allocator, input_tokens, 8)
+                    available = allocator.available_size()
+                    decisions[0] = capacity.end()
+                dist.broadcast_object_list(decisions, src=0)
+                if rank == 1:
+                    capacity.begin(decisions[0])
+                    decided = _admission(allocator, input_tokens, 8)
+                    available = allocator.available_size()
+                    capacity.end()
+                allocator.stage_capacity = None
                 record = dict(
                     tokens=config.max_total_num_tokens,
                     requests=config.max_running_requests,
-                    available=allocator.available_size(),
-                    admitted=_admission(allocator, input_tokens, 8),
+                    alone=alone,
+                    available=available,
+                    admitted=decided,
                 )
                 results = [None, None]
                 dist.all_gather_object(results, record)
-                assert results[0] == results[1], (phase, results)
-                assert record["admitted"] == 2, (phase, results)
-                assert record["available"] == record["tokens"], (phase, results)
+                shared = [{k: v for k, v in r.items() if k != "alone"} for r in results]
+                assert shared[0] == shared[1], (phase, results)
+                # Alone, each stage admits what fits its own arena; together
+                # they admit what fits both.
+                alone = [r["alone"] for r in results]
+                assert alone[0] != alone[1], (phase, results)
+                assert record["admitted"] == min(alone), (phase, results)
     finally:
         dist.destroy_process_group()
 
 
 class TestPipelineAdmission(CustomTestCase):
     def test_unequal_stages_admit_identical_batches_after_build_and_resize(self):
-        """Unequal PP stages must select the same batch, including the MIN stage."""
+        """Unequal PP stages select the same batch, the one the first stage
+        decides fits every stage, before and after the post-capture resize."""
         with tempfile.TemporaryDirectory() as tmp:
             mp.spawn(admission_worker, args=(tmp + "/rendezvous",), nprocs=2, join=True)
 

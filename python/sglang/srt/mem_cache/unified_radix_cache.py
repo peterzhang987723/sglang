@@ -220,6 +220,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # When a list, every device eviction step appends (component, node id,
+    # units evicted per component): how pipeline stages compare evictions.
+    eviction_log: Optional[list] = None
 
     def __init__(
         self,
@@ -1153,7 +1156,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="write_through_unbacked_eviction",
             )
         self._accumulate_tracker(tracker, result.tracker)
+        self._log_eviction(component_type, result.node_id, result.tracker)
         return result.node_id, result.made_progress
+
+    def _log_eviction(
+        self,
+        component_type: Optional[ComponentType],
+        node_id: Optional[NodeId],
+        evicted: dict[ComponentType, int],
+    ) -> None:
+        if self.eviction_log is not None and (node_id is not None or evicted):
+            self.eviction_log.append(
+                (
+                    None if component_type is None else int(component_type),
+                    node_id,
+                    tuple(sorted((int(ct), n) for ct, n in evicted.items())),
+                )
+            )
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
@@ -1168,6 +1187,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="write_through_unbacked_eviction",
             )
         self._accumulate_tracker(tracker, result.tracker)
+        self._log_eviction(None, node_id, result.tracker)
         return result.backup_kv
 
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
