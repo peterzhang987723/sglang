@@ -1,0 +1,49 @@
+name: SGLang PR 49211 CPU verification
+
+on:
+  push:
+    branches:
+      - codex/validate-sglang-49211-cpu
+
+permissions:
+  contents: read
+
+jobs:
+  diffusion-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact PR revision
+        uses: actions/checkout@v4
+        with:
+          repository: peterzhang987723/sglang
+          ref: fddafe37c1880019968b4d6c62d83d05b6638dce
+          persist-credentials: false
+
+      - name: Verify revision
+        run: test "$(git rev-parse HEAD)" = fddafe37c1880019968b4d6c62d83d05b6638dce
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install protoc and Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Install SGLang and test dependencies
+        timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: '1'
+        run: uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Run both upstream CPU test files
+        working-directory: test
+        timeout-minutes: 10
+        run: |
+          status=0
+          python3 registered/unit/dllm/test_gemma4_diffusion.py -f || status=1
+          python3 registered/unit/dllm/test_gemma4_renoise.py -f || status=1
+          exit "$status"
